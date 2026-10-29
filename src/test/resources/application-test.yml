@@ -1,0 +1,18 @@
+app:
+  rate-limit:
+    enabled: false
+  webhooks:
+    dispatcher-enabled: false
+    max-attempts: 3
+    backoff-base: PT0S
+    backoff-max: PT0S
+    lease: PT0S
+    request-timeout: PT2S
+    allow-private-hosts: true
+  reconciliation:
+    enabled: false
+
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 20

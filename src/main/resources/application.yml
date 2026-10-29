@@ -1,0 +1,72 @@
+spring:
+  application:
+    name: paycore
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/paycore}
+    username: ${DATABASE_USERNAME:paycore}
+    password: ${DATABASE_PASSWORD:paycore}
+    hikari:
+      maximum-pool-size: ${DATABASE_POOL_SIZE:20}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  jackson:
+    default-property-inclusion: non_null
+  mvc:
+    problemdetails:
+      enabled: true
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  health:
+    redis:
+      # Redis only backs rate limiting, which fails open; losing it must not mark the service unhealthy.
+      enabled: false
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+app:
+  jwt:
+    # Must be at least 32 bytes. Override in every real environment.
+    secret: ${JWT_SECRET:change-me-change-me-change-me-change-me}
+    issuer: paycore
+    ttl: PT1H
+  rate-limit:
+    enabled: ${RATE_LIMIT_ENABLED:true}
+    window: PT1M
+    authenticated-limit: 300
+    anonymous-limit: 30
+  idempotency:
+    retention: P1D
+  webhooks:
+    dispatcher-enabled: true
+    poll-interval: PT2S
+    batch-size: 50
+    max-attempts: 8
+    backoff-base: PT10S
+    backoff-max: PT1H
+    lease: PT1M
+    request-timeout: PT5S
+    allow-private-hosts: ${WEBHOOKS_ALLOW_PRIVATE_HOSTS:false}
+  reconciliation:
+    enabled: true
+    cron: "0 0 * * * *"
