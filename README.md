@@ -203,6 +203,42 @@ on every push.
 
 Fine-grained settings (backoff, batch size, limits) live under `app.*` in `application.yml`.
 
+## Deploying to Azure
+
+```mermaid
+flowchart LR
+    GH[push to main] --> CI[GitHub Actions<br/>test → image → GHCR] -->|OIDC, no secrets| CA
+    subgraph Azure
+        CA[Container Apps<br/>paycore + Redis sidecar] --> PG[(PostgreSQL<br/>Flexible Server)]
+        CA -.->|OpenTelemetry agent| AI[Application Insights] --> AL[Error-rate alert]
+    end
+```
+
+`infra/main.bicep` describes the whole environment, sized for the free tiers of an Azure for Students subscription:
+Container Apps scales to zero, PostgreSQL runs on the free B1ms SKU, logs are capped at the free 5 GB/month, and Redis
+runs as a sidecar because Azure Cache for Redis has no free tier.
+
+```bash
+az login
+ALERT_EMAIL=you@example.com scripts/azure-deploy.sh   # first run ~10 min, mostly PostgreSQL
+```
+
+The script deploys the Bicep template, reuses existing secrets on re-runs, and sets the repository variables the
+`deploy` job needs. From then on every push to `main` builds an image, rolls out a new revision with
+`az containerapp update`, and smoke-tests `/actuator/health`. GitHub Actions authenticates through a federated
+credential on a user-assigned identity that is Contributor on this resource group only. The GHCR package must be
+public (or the app given registry credentials) for Container Apps to pull it.
+
+With `minReplicas: 0` the app is free when idle, but the first request after a pause takes a cold start and the
+webhook dispatcher and reconciliation job only run while a replica is up. Deploy with `MIN_REPLICAS=1` to keep it warm.
+
+**Load test:** `loadtest/transfers.js` (k6) funds a pool of wallets, fires concurrent transfers between them, and
+fails if the wallets' total afterwards differs from what was deposited.
+
+```bash
+k6 run -e BASE_URL=https://<your-app>.azurecontainerapps.io -e USERS=50 loadtest/transfers.js
+```
+
 ## Known trade-offs and next steps
 
 - **Hot settlement wallet:** every deposit in a currency locks the same settlement row, which caps deposit throughput.

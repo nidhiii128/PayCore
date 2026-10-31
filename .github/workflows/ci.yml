@@ -4,9 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/paycore
 
 jobs:
   test:
@@ -38,13 +42,72 @@ jobs:
     name: Docker image
     runs-on: ubuntu-latest
     needs: test
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+
+      # Pull requests only build; pushes and manual runs publish to GitHub Container Registry.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
-          tags: paycore:${{ github.sha }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/main' && format('{0}:latest', env.IMAGE) || '' }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: docker
+    # Skipped until scripts/azure-deploy.sh has provisioned Azure and set these repository variables.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.AZURE_CONTAINERAPP != ''
+    concurrency:
+      group: deploy-azure
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # OIDC: GitHub's token is exchanged for one of the user-assigned identity's. No Azure secret is stored here.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Roll out new revision
+        run: |
+          az containerapp update -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.AZURE_CONTAINERAPP }}" \
+            --container-name paycore --image "$IMAGE:${{ github.sha }}" -o none
+
+      - name: Smoke test
+        run: |
+          app=$(az containerapp show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.AZURE_CONTAINERAPP }}" -o json)
+          url="https://$(jq -r .properties.configuration.ingress.fqdn <<<"$app")"
+          if [ "$(jq -r .properties.latestReadyRevisionName <<<"$app")" != "$(jq -r .properties.latestRevisionName <<<"$app")" ]; then
+            echo "::error::new revision is not ready; the previous one is still serving"
+            exit 1
+          fi
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 10 "$url/actuator/health" | grep -q '"UP"'; then
+              echo "Healthy: $url"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$url/actuator/health did not report UP"
+          exit 1
