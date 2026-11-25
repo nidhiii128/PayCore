@@ -1,9 +1,11 @@
 # Paycore
 
 A payment backend that moves money correctly: wallets backed by a double-entry ledger, idempotent transfers that are
-safe under concurrency, a transactional webhook outbox, and an append-only audit trail.
+safe under concurrency, a transactional webhook outbox, and an append-only audit trail. A small React front end in
+`frontend/` lets you log in, see wallets and ledger entries, and send transfers (see [Front end](#front-end)).
 
-**Stack:** Java 21 · Spring Boot 3.5 · PostgreSQL 16 · Redis · Flyway · JWT · Testcontainers · Docker · GitHub Actions
+**Stack:** Java 21 · Spring Boot 3.5 · PostgreSQL 16 · Redis · Flyway · JWT · Testcontainers · Docker · GitHub Actions ·
+React 19 + TypeScript (Vite) · Vitest · Playwright
 
 ---
 
@@ -62,6 +64,77 @@ curl -s localhost:8080/api/v1/wallets/$WALLET/transactions -H "$AUTH"
 All errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem documents with a stable `code`
 (`INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `IDEMPOTENCY_KEY_REUSED`, ...). Resources owned by someone else return
 `404`, not `403`, so IDs can't be probed.
+
+---
+
+## Front end
+
+A small React and TypeScript app (built with Vite) in `frontend/`. You can log in, see your wallets and balances, read
+a wallet's recent ledger entries and send a transfer. It only uses the endpoints in the table above, and the backend
+needed no changes for it.
+
+### Run it
+
+You need Node 20.19 or newer (Node 22 is what CI uses).
+
+```bash
+docker compose up --build    # backend on http://localhost:8080, in one terminal
+
+cd frontend                  # in a second terminal
+npm ci
+npm run seed                 # optional: a demo user with two INR wallets and ₹1,000
+npm run dev                  # open http://localhost:5173
+```
+
+`npm run seed` prints the email and password to log in with. It is safe to run twice. To use a backend on another
+address, set `PAYCORE_API_URL`, for example `PAYCORE_API_URL=http://localhost:8081 npm run dev`.
+
+### How it works
+
+- **No CORS needed.** The browser calls `/api/...` on the page's own origin, and the Vite dev server forwards those
+  calls to the backend. To deploy the UI, serve the built files (`npm run build` writes them to `frontend/dist`) from
+  the same origin as the API, for example behind one ingress, or add a CORS rule to the backend.
+- **Token in memory only.** The JWT is kept in a JavaScript variable, never in localStorage or sessionStorage. A script
+  injected into the page cannot read it from storage, and it is gone when the tab closes. The cost is that reloading
+  the page logs you out.
+- **401 handling.** If a call that sent the token gets `401` (expired or invalid token), the app forgets the token and
+  shows the login page with "Your session has ended". A `401` from the login form just means a wrong password and is
+  shown on the form.
+- **Idempotent transfers.** Every transfer sends a new `Idempotency-Key` (a random UUID). If the request fails with a
+  network error, the app cannot know whether the server got it. So the next submit of the same transfer reuses the same
+  key, and the backend replays the first result instead of moving the money twice. Any answer from the server ends
+  that key.
+- **No double submit.** The Send button is disabled while a transfer is in flight. A ref also blocks a second submit
+  that arrives before React has re-rendered the button.
+- **Clear errors.** The app reads the problem document's `code` and shows a plain message, for example "This wallet
+  does not have enough money for that transfer." Errors about one field (`INSUFFICIENT_FUNDS`, `WALLET_NOT_FOUND`,
+  `CURRENCY_MISMATCH` and the `errors` map of `VALIDATION_FAILED`) are shown next to that field.
+- **Accessibility.** Every input has a label. A field with an error gets `aria-invalid="true"` and points to its
+  message with `aria-describedby`. After a failed submit, focus moves to an error summary whose items link to the
+  fields. Everything works with the keyboard, and one end-to-end test sends a transfer using only the keyboard.
+
+### Front end tests
+
+```bash
+cd frontend
+npm test                     # Vitest + Testing Library, no backend needed
+npx playwright install chromium   # first time only
+npm run test:e2e             # Playwright in Chromium against the real backend (start it first)
+```
+
+The end-to-end tests start Vite themselves and create their own users through the API, so they also work on a
+database that already has data. If the backend is not running they stop at once and say so.
+
+| Suite | What it proves |
+|---|---|
+| `money.test.ts` | "12.50" becomes 1250 minor units without float errors, decimals follow the currency (JPY has none), the backend's maximum amount is enforced |
+| `client.test.ts` | Bearer token and `Idempotency-Key` headers are sent, problem documents become typed errors, `401` logs out except on login, network errors and non JSON error bodies are handled |
+| `TransferForm.test.tsx` | A double click or a double Enter sends one request, the button is disabled in flight, browser and server validation errors land on the right fields with `aria-invalid`, focus moves to the error summary, the key is reused only after a network failure |
+| `App.test.tsx` | Login shows wallets and entries, the token never reaches Web Storage, `401` returns to login, wrong password message |
+| `e2e/transfers.spec.ts` | Against the real backend: balances and ledger after login, a keyboard only transfer, insufficient funds with no money moved, unknown wallet, a double click makes exactly one transfer (checked in the ledger), wrong password, a tampered token sends you back to login |
+
+CI runs lint, type check, build and unit tests in one job. A second job starts the real backend with PostgreSQL and
+Redis and runs the Playwright tests. The Docker image is only built when the backend and front end jobs all pass.
 
 ---
 
@@ -202,6 +275,42 @@ on every push.
 | `WEBHOOKS_ALLOW_PRIVATE_HOSTS` | `false` | Allow `http://` and private IPs (local dev only) |
 
 Fine-grained settings (backoff, batch size, limits) live under `app.*` in `application.yml`.
+
+## Deploying to Azure
+
+```mermaid
+flowchart LR
+    GH[push to main] --> CI[GitHub Actions<br/>test → image → GHCR] -->|OIDC, no secrets| CA
+    subgraph Azure
+        CA[Container Apps<br/>paycore + Redis sidecar] --> PG[(PostgreSQL<br/>Flexible Server)]
+        CA -.->|OpenTelemetry agent| AI[Application Insights] --> AL[Error-rate alert]
+    end
+```
+
+`infra/main.bicep` describes the whole environment, sized for the free tiers of an Azure for Students subscription:
+Container Apps scales to zero, PostgreSQL runs on the free B1ms SKU, logs are capped at the free 5 GB/month, and Redis
+runs as a sidecar because Azure Cache for Redis has no free tier.
+
+```bash
+az login
+ALERT_EMAIL=you@example.com scripts/azure-deploy.sh   # first run ~10 min, mostly PostgreSQL
+```
+
+The script deploys the Bicep template, reuses existing secrets on re-runs, and sets the repository variables the
+`deploy` job needs. From then on every push to `main` builds an image, rolls out a new revision with
+`az containerapp update`, and smoke-tests `/actuator/health`. GitHub Actions authenticates through a federated
+credential on a user-assigned identity that is Contributor on this resource group only. The GHCR package must be
+public (or the app given registry credentials) for Container Apps to pull it.
+
+With `minReplicas: 0` the app is free when idle, but the first request after a pause takes a cold start and the
+webhook dispatcher and reconciliation job only run while a replica is up. Deploy with `MIN_REPLICAS=1` to keep it warm.
+
+**Load test:** `loadtest/transfers.js` (k6) funds a pool of wallets, fires concurrent transfers between them, and
+fails if the wallets' total afterwards differs from what was deposited.
+
+```bash
+k6 run -e BASE_URL=https://<your-app>.azurecontainerapps.io -e USERS=50 loadtest/transfers.js
+```
 
 ## Known trade-offs and next steps
 
